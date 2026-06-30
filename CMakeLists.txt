@@ -1,0 +1,5 @@
+if(CONFIG_ZMK_TRACKBALL_CONFIG)
+  zephyr_library()
+  zephyr_library_sources(src/trackball_config.c)
+  zephyr_include_directories(${APPLICATION_SOURCE_DIR}/include)
+endif()

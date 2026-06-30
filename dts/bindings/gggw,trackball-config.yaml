@@ -1,0 +1,40 @@
+# Copyright (c) 2026 Vincent Franco
+# SPDX-License-Identifier: MIT
+
+description: |
+  Central-side BLE service that lets a host app configure both trackballs'
+  Mode (pipeline) and CPI. References, per side, the pipeline-switch processor
+  (for mode introspection), the pipeline-switch behavior (invoke target), and
+  the res-set behavior (CPI introspection + invoke target).
+
+compatible: "gggw,trackball-config"
+
+properties:
+  left-pipeline:
+    required: true
+    type: phandle
+    description: Left ball's zmk,input-processor-pipeline-switch (mode introspection).
+  right-pipeline:
+    required: true
+    type: phandle
+    description: Right ball's zmk,input-processor-pipeline-switch (mode introspection).
+  left-mode-behavior:
+    required: true
+    type: phandle
+    description: Left ball's zmk,behavior-pipeline-switch (mode invoke target; relayed).
+  right-mode-behavior:
+    required: true
+    type: phandle
+    description: Right ball's zmk,behavior-pipeline-switch (mode invoke target; local).
+  left-cpi:
+    required: true
+    type: phandle
+    description: Left ball's zmk,behavior-paw32xx-res-set (CPI introspection + invoke; relayed).
+  right-cpi:
+    required: true
+    type: phandle
+    description: Right ball's zmk,behavior-paw32xx-res-set (CPI introspection + invoke; local).
+  left-peripheral-source:
+    type: int
+    default: 0
+    description: Split source index of the left (peripheral) half for relayed invocations.
