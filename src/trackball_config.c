@@ -2,16 +2,22 @@
  * Copyright (c) 2026 Vincent Franco
  * SPDX-License-Identifier: MIT
  *
- * Central-side custom GATT service for configuring both trackballs' Mode
- * (pipeline) and CPI from a host app, over the air.
+ * Central-side config service for both trackballs' Mode (pipeline) and CPI,
+ * driven from a host app over a USB CDC-ACM serial link (Web Serial). See
+ * CONTEXT.md and docs/adr/0004 (USB transport).
  *
- * Design (see plan): the central is the SOLE originator of changes. It drives
- * each ball by invoking the per-side EVENT_SOURCE behaviors with
- * zmk_behavior_invoke_binding():
+ * Design: the central is the SOLE originator of changes. It drives each ball by
+ * invoking the per-side EVENT_SOURCE behaviors with zmk_behavior_invoke_binding():
  *   - right (central) ball -> event.source = LOCAL (255), runs locally;
  *   - left  (peripheral) ball -> event.source = peripheral index, relayed.
- * It keeps an authoritative, central-persisted MIRROR of both balls' state so
- * it can answer reads without a peripheral->central report.
+ * It keeps an authoritative, central-persisted MIRROR of both balls' state so it
+ * can answer reads without a peripheral->central report.
+ *
+ * Wire protocol (host always initiates; device only replies, no async):
+ *   frame = 0xAB | type:u8 | len:u16 LE | payload[len]
+ *   0x01 REQ_DESCRIBE          -> 0x81 DESCRIBE (describe blob)
+ *   0x02 REQ_STATE             -> 0x82 STATE (6 bytes)
+ *   0x03 REQ_CONTROL (5 bytes) -> 0x82 STATE (6 bytes, the new state)
  */
 #define DT_DRV_COMPAT gggw_trackball_config
 
@@ -22,11 +28,9 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/ring_buffer.h>
 
-#include <zephyr/bluetooth/att.h>
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/gatt.h>
-#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/drivers/uart.h>
 
 #include <zmk/behavior.h>
 #include <zmk/events/position_state_changed.h>
@@ -40,6 +44,10 @@ LOG_MODULE_REGISTER(trackball_config, CONFIG_ZMK_LOG_LEVEL);
 
 BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) == 1,
              "exactly one gggw,trackball-config node is supported");
+
+#if !DT_HAS_CHOSEN(gggw_trackball_config_uart)
+#error "gggw,trackball-config-uart chosen node is required (a cdc-acm-uart port)"
+#endif
 
 #define TB_NODE DT_DRV_INST(0)
 
@@ -119,16 +127,7 @@ static int drive(const struct device *behavior, uint8_t source, uint32_t value, 
     return zmk_behavior_invoke_binding(&binding, event, false);
 }
 
-/* --- GATT --- */
-#define TBCFG_UUID(last)                                                                           \
-    BT_UUID_128_ENCODE(0x7242b0##last, 0xba11, 0x4c0d, 0x9e00, 0xa11ce0bca11e)
-
-static const struct bt_uuid_128 svc_uuid = BT_UUID_INIT_128(TBCFG_UUID(00));
-static const struct bt_uuid_128 describe_uuid = BT_UUID_INIT_128(TBCFG_UUID(01));
-static const struct bt_uuid_128 state_uuid = BT_UUID_INIT_128(TBCFG_UUID(02));
-static const struct bt_uuid_128 control_uuid = BT_UUID_INIT_128(TBCFG_UUID(03));
-
-/* Describe blob, built once at init. Layout:
+/* --- describe blob, built once at init. Layout:
  *   u8 version
  *   per side (left, right):
  *     u8 mode_count
@@ -171,11 +170,6 @@ static void build_describe(void) {
     describe_len = o;
 }
 
-static ssize_t describe_read(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-                             uint16_t len, uint16_t offset) {
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, describe_blob, describe_len);
-}
-
 /* State blob (6 bytes): left_mode u8, left_cpi u16, right_mode u8, right_cpi u16. */
 static void build_state(uint8_t out[6]) {
     out[0] = mirror.mode[SIDE_LEFT];
@@ -184,44 +178,22 @@ static void build_state(uint8_t out[6]) {
     sys_put_le16(mirror.cpi[SIDE_RIGHT], &out[4]);
 }
 
-static ssize_t state_read(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-                          uint16_t len, uint16_t offset) {
-    uint8_t blob[6];
-    build_state(blob);
-    return bt_gatt_attr_read(conn, attr, buf, len, offset, blob, sizeof(blob));
-}
-
-/* Implemented after BT_GATT_SERVICE_DEFINE (needs the static service symbol). */
-static void notify_state(void);
-
-static void state_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value) {
-    LOG_DBG("trackball state notifications %s", value == BT_GATT_CCC_NOTIFY ? "on" : "off");
-}
-
-static ssize_t control_write(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf,
-                             uint16_t len, uint16_t offset, uint8_t flags) {
-    if (offset != 0) {
-        return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-    }
-    if (len != 5) {
-        return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
-    }
-
-    const uint8_t *p = buf;
-    uint8_t side = p[0];
-    uint8_t kind = p[1];
-    uint16_t value = sys_get_le16(&p[2]);
-    bool commit = (p[4] & FLAG_COMMIT) != 0;
+/* Apply a 5-byte control command to a ball + the mirror. Returns 0 or -errno. */
+static int apply_control(const uint8_t cmd[5]) {
+    uint8_t side = cmd[0];
+    uint8_t kind = cmd[1];
+    uint16_t value = sys_get_le16(&cmd[2]);
+    bool commit = (cmd[4] & FLAG_COMMIT) != 0;
 
     if (side > SIDE_RIGHT) {
-        return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+        return -EINVAL;
     }
 
     int err;
     switch (kind) {
     case KIND_MODE:
         if (value >= zip_pipeline_switch_count(pipeline_dev[side])) {
-            return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+            return -EINVAL;
         }
         err = drive(mode_behavior[side], side_source[side], value, commit);
         if (!err) {
@@ -245,43 +217,149 @@ static ssize_t control_write(struct bt_conn *conn, const struct bt_gatt_attr *at
         break;
     }
     default:
-        return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+        return -EINVAL;
     }
 
     if (err) {
         LOG_ERR("control: side %u kind %u value %u failed (%d)", side, kind, value, err);
-        return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+        return err;
     }
 
     if (commit) {
         k_work_reschedule(&save_work, K_MSEC(2000));
     }
-
-    notify_state();
-    return len;
+    return 0;
 }
 
-/* Attribute indices (keep in sync with notify above):
- *   0 primary service
- *   1 describe characteristic decl, 2 describe value
- *   3 state characteristic decl,    4 state value, 5 state CCC
- *   6 control characteristic decl,  7 control value
- */
-BT_GATT_SERVICE_DEFINE(
-    trackball_svc, BT_GATT_PRIMARY_SERVICE(&svc_uuid),
-    BT_GATT_CHARACTERISTIC(&describe_uuid.uuid, BT_GATT_CHRC_READ, BT_GATT_PERM_READ, describe_read,
-                           NULL, NULL),
-    BT_GATT_CHARACTERISTIC(&state_uuid.uuid, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_READ, state_read, NULL, NULL),
-    BT_GATT_CCC(state_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
-    BT_GATT_CHARACTERISTIC(&control_uuid.uuid, BT_GATT_CHRC_WRITE, BT_GATT_PERM_WRITE_ENCRYPT, NULL,
-                           control_write, NULL));
+/* --- USB CDC-ACM transport --- */
+#define UART_NODE DT_CHOSEN(gggw_trackball_config_uart)
+static const struct device *const uart_dev = DEVICE_DT_GET(UART_NODE);
 
-/* attrs[4] = state value attribute (0 svc, 1-2 describe, 3-4 state, 5 ccc, 6-7 control). */
-static void notify_state(void) {
-    uint8_t blob[6];
-    build_state(blob);
-    bt_gatt_notify(NULL, &trackball_svc.attrs[4], blob, sizeof(blob));
+/* Frame: 0xAB | type:u8 | len:u16 LE | payload[len] */
+#define FRAME_START 0xAB
+#define MSG_REQ_DESCRIBE 0x01
+#define MSG_REQ_STATE    0x02
+#define MSG_REQ_CONTROL  0x03
+#define MSG_DESCRIBE     0x81
+#define MSG_STATE        0x82
+
+/* Inbound payloads are tiny (REQ_CONTROL is the largest at 5 bytes). */
+#define MAX_REQ_PAYLOAD 8
+
+RING_BUF_DECLARE(rx_rb, 64);
+K_SEM_DEFINE(rx_sem, 0, 1);
+
+/* Send one frame. Called only from the rx thread, so no TX locking is needed. */
+static void send_frame(uint8_t type, const uint8_t *data, uint16_t len) {
+    uint8_t hdr[4] = {FRAME_START, type, (uint8_t)(len & 0xff), (uint8_t)(len >> 8)};
+    for (int i = 0; i < (int)sizeof(hdr); i++) {
+        uart_poll_out(uart_dev, hdr[i]);
+    }
+    for (uint16_t i = 0; i < len; i++) {
+        uart_poll_out(uart_dev, data[i]);
+    }
+}
+
+static void dispatch(uint8_t type, const uint8_t *payload, uint16_t len) {
+    uint8_t state[6];
+
+    switch (type) {
+    case MSG_REQ_DESCRIBE:
+        send_frame(MSG_DESCRIBE, describe_blob, describe_len);
+        break;
+    case MSG_REQ_STATE:
+        build_state(state);
+        send_frame(MSG_STATE, state, sizeof(state));
+        break;
+    case MSG_REQ_CONTROL:
+        if (len == 5) {
+            apply_control(payload);
+        } else {
+            LOG_WRN("REQ_CONTROL bad length %u", len);
+        }
+        /* Reply with the (possibly unchanged) authoritative state either way. */
+        build_state(state);
+        send_frame(MSG_STATE, state, sizeof(state));
+        break;
+    default:
+        LOG_WRN("unknown request type 0x%02x", type);
+        break;
+    }
+}
+
+/* Byte-at-a-time frame parser, fed from the rx ring buffer by the rx thread. */
+static void parse_byte(uint8_t b) {
+    static enum { S_START, S_TYPE, S_LEN0, S_LEN1, S_PAYLOAD } state = S_START;
+    static uint8_t type;
+    static uint16_t len, got;
+    static uint8_t payload[MAX_REQ_PAYLOAD];
+
+    switch (state) {
+    case S_START:
+        if (b == FRAME_START) {
+            state = S_TYPE;
+        }
+        break;
+    case S_TYPE:
+        type = b;
+        state = S_LEN0;
+        break;
+    case S_LEN0:
+        len = b;
+        state = S_LEN1;
+        break;
+    case S_LEN1:
+        len |= (uint16_t)b << 8;
+        got = 0;
+        if (len > MAX_REQ_PAYLOAD) {
+            LOG_WRN("frame payload too long (%u), dropping", len);
+            state = S_START;
+        } else if (len == 0) {
+            dispatch(type, NULL, 0);
+            state = S_START;
+        } else {
+            state = S_PAYLOAD;
+        }
+        break;
+    case S_PAYLOAD:
+        payload[got++] = b;
+        if (got == len) {
+            dispatch(type, payload, len);
+            state = S_START;
+        }
+        break;
+    }
+}
+
+static void rx_thread_main(void) {
+    for (;;) {
+        k_sem_take(&rx_sem, K_FOREVER);
+        uint8_t b;
+        while (ring_buf_get(&rx_rb, &b, 1) == 1) {
+            parse_byte(b);
+        }
+    }
+}
+
+K_THREAD_DEFINE(tbcfg_rx_thread, 1024, rx_thread_main, NULL, NULL, NULL, K_PRIO_PREEMPT(10), 0, 0);
+
+static void uart_cb(const struct device *dev, void *user_data) {
+    ARG_UNUSED(user_data);
+    if (!uart_irq_update(dev)) {
+        return;
+    }
+    while (uart_irq_rx_ready(dev)) {
+        uint8_t tmp[32];
+        int n = uart_fifo_read(dev, tmp, sizeof(tmp));
+        if (n <= 0) {
+            break;
+        }
+        uint32_t put = ring_buf_put(&rx_rb, tmp, n);
+        if (put < (uint32_t)n) {
+            LOG_WRN("rx ring buffer full, dropped %d bytes", n - (int)put);
+        }
+    }
+    k_sem_give(&rx_sem);
 }
 
 /* --- settings (mirror persistence) --- */
@@ -300,8 +378,9 @@ static int tbcfg_settings_set(const char *name, size_t len, settings_read_cb rea
 
 SETTINGS_STATIC_HANDLER_DEFINE(trackball_config, "tbcfg", NULL, tbcfg_settings_set, NULL, NULL);
 
-/* --- init: build describe, seed mirror from device defaults unless a
- * persisted value was already loaded by the settings subsystem. --- */
+/* --- init: build describe, seed mirror from device defaults unless a persisted
+ * value was already loaded by the settings subsystem, then bring up the CDC-ACM
+ * transport. --- */
 static int trackball_config_init(void) {
     k_work_init_delayable(&save_work, save_work_cb);
     build_describe();
@@ -312,15 +391,27 @@ static int trackball_config_init(void) {
             mirror.cpi[s] = paw32xx_res_set_get(cpi_dev[s]);
         }
     }
+
+    if (!device_is_ready(uart_dev)) {
+        LOG_ERR("config UART not ready");
+        return -ENODEV;
+    }
+    int err = uart_irq_callback_user_data_set(uart_dev, uart_cb, NULL);
+    if (err < 0) {
+        LOG_ERR("Failed to set config UART callback (%d)", err);
+        return err;
+    }
+    uart_irq_rx_enable(uart_dev);
+
     LOG_INF("trackball config ready: L mode %u cpi %u / R mode %u cpi %u",
             mirror.mode[SIDE_LEFT], mirror.cpi[SIDE_LEFT], mirror.mode[SIDE_RIGHT],
             mirror.cpi[SIDE_RIGHT]);
     return 0;
 }
 
-/* APPLICATION priority: after POST_KERNEL devices (pipelines, behaviors) and
- * around the settings load, so device introspection is valid. The mirror_loaded
- * guard makes us order-independent w.r.t. settings_load(). */
+/* APPLICATION priority: after POST_KERNEL devices (pipelines, behaviors, the USB
+ * CDC-ACM uart) and around the settings load, so device introspection is valid.
+ * The mirror_loaded guard makes us order-independent w.r.t. settings_load(). */
 SYS_INIT(trackball_config_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT) */

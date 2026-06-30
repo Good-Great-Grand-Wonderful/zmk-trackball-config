@@ -1,16 +1,17 @@
 DT_COMPAT_GGGW_TRACKBALL_CONFIG := gggw,trackball-config
 
 config ZMK_TRACKBALL_CONFIG
-	bool "Host-facing BLE service to configure trackball mode and CPI"
+	bool "Host-facing USB serial service to configure trackball mode and CPI"
 	default $(dt_compat_enabled,$(DT_COMPAT_GGGW_TRACKBALL_CONFIG))
-	depends on BT_PERIPHERAL
+	depends on SERIAL
 	depends on ZMK_INPUT_PROCESSOR_PIPELINE_SWITCH
 	depends on ZMK_BEHAVIOR_PIPELINE_SWITCH
 	depends on ZMK_BEHAVIOR_PAW32XX_RES_SET
 	imply SETTINGS
 	help
-	  Exposes a custom GATT service on the central half so a host app can
-	  read each trackball's available modes + CPI range (Describe), read the
-	  current selection (State, with notify), and change them (Control). The
-	  central is the sole originator: it relays changes to the left
-	  (peripheral) ball and keeps an authoritative, persisted mirror.
+	  Exposes a config protocol over a USB CDC-ACM serial port on the central
+	  half (the chosen gggw,trackball-config-uart node) so a host app can read
+	  each trackball's available modes + CPI range (Describe), read the current
+	  selection (State), and change them (Control). The central is the sole
+	  originator: it relays changes to the left (peripheral) ball and keeps an
+	  authoritative, persisted mirror.
