@@ -57,7 +57,19 @@ applies a change; the device replies with the new `STATE`.
 
 **Commit**:
 The control flag distinguishing live preview (`commit=0`, RAM-only, e.g. while
-dragging a slider) from apply-and-persist (`commit=1`, on release).
+dragging a slider) from apply-and-persist (`commit=1`, on release). A Commit
+triggers both an Apply and a Save.
+
+**Apply**:
+Writing a setting into the live hardware so it takes effect now - for CPI, a CPI
+register write to the PAW3222 over SPI. Volatile: lost on power-down, so it must
+be re-done on every boot. Free of flash wear.
+_Avoid_: set, write (ambiguous with Save).
+
+**Save**:
+Writing a setting to flash (NVS) so it survives a power cycle. Wears flash, so it
+is debounced and only happens on Commit - never on boot or resume.
+_Avoid_: persist, write, store (use Save for the flash write specifically).
 
 ## State
 
